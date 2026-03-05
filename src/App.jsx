@@ -1,8 +1,19 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceLine, AreaChart, Area, BarChart, Bar, Legend
 } from "recharts";
+
+// ─── SEEDED PRNG (mulberry32) ─────────────────────────────────────────────────
+
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 // ─── ALGORITHM CORE ──────────────────────────────────────────────────────────
 
@@ -30,32 +41,43 @@ function calcEMA(data, period) {
   return result;
 }
 
+// Fixed: Wilder's Smoothing Method (matches TradingView RSI-14)
 function calcRSI(data, period = 14) {
+  if (data.length < period + 1) return Array(data.length).fill(null);
   const result = Array(period).fill(null);
-  for (let i = period; i < data.length; i++) {
-    const slice = data.slice(i - period, i + 1);
-    let gains = 0, losses = 0;
-    for (let j = 1; j < slice.length; j++) {
-      const d = slice[j].close - slice[j - 1].close;
-      if (d > 0) gains += d; else losses -= d;
-    }
-    const avgGain = gains / period;
-    const avgLoss = losses / period;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = data[i].close - data[i - 1].close;
+    if (d > 0) avgGain += d; else avgLoss -= d;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+  const rs0 = avgLoss === 0 ? 100 : avgGain / avgLoss;
+  result.push(parseFloat((100 - 100 / (1 + rs0)).toFixed(2)));
+  for (let i = period + 1; i < data.length; i++) {
+    const d = data[i].close - data[i - 1].close;
+    avgGain = (avgGain * (period - 1) + Math.max(d, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-d, 0)) / period;
     const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
     result.push(parseFloat((100 - 100 / (1 + rs)).toFixed(2)));
   }
   return result;
 }
 
+// Fixed: signal EMA only runs on valid MACD values (not on zero-padded nulls)
 function calcMACD(data) {
   const ema12 = calcEMA(data, 12);
   const ema26 = calcEMA(data, 26);
   const macdLine = data.map((_, i) =>
     ema12[i] != null && ema26[i] != null ? parseFloat((ema12[i] - ema26[i]).toFixed(4)) : null
   );
-  const validMacd = macdLine.map((v, i) => ({ close: v ?? 0, i }));
-  const signalRaw = calcEMA(validMacd.map(x => ({ close: x.close })), 9);
-  const signal = macdLine.map((v, i) => v != null ? signalRaw[i] : null);
+  const firstValid = macdLine.findIndex(v => v !== null);
+  if (firstValid === -1) {
+    return { macdLine, signal: macdLine.map(() => null), histogram: macdLine.map(() => null) };
+  }
+  const validSlice = macdLine.slice(firstValid).map(v => ({ close: v }));
+  const signalSlice = calcEMA(validSlice, 9);
+  const signal = [...Array(firstValid).fill(null), ...signalSlice];
   const histogram = macdLine.map((v, i) =>
     v != null && signal[i] != null ? parseFloat((v - signal[i]).toFixed(4)) : null
   );
@@ -77,6 +99,7 @@ function generateSignals(data, ema20, ema50, rsi) {
   return signals;
 }
 
+// Fixed: profit and pct are per-trade, not cumulative from $10k
 function backtest(data, signals) {
   let cash = 10000, shares = 0, trades = [];
   let position = null;
@@ -86,23 +109,33 @@ function backtest(data, signals) {
       cash -= shares * sig.price;
       position = sig;
     } else if (sig.type === "SELL" && shares > 0) {
-      const profit = shares * sig.price + cash - 10000;
-      const pct = ((shares * sig.price + cash) / 10000 - 1) * 100;
-      trades.push({ buy: position.date, sell: sig.date, buyPrice: position.price, sellPrice: sig.price, profit: parseFloat(profit.toFixed(2)), pct: parseFloat(pct.toFixed(2)) });
+      const profit = parseFloat(((sig.price - position.price) * shares).toFixed(2));
+      const pct = parseFloat(((sig.price / position.price - 1) * 100).toFixed(2));
+      trades.push({
+        buy: position.date, sell: sig.date,
+        buyPrice: position.price, sellPrice: sig.price,
+        shares, profit, pct,
+      });
       cash += shares * sig.price;
       shares = 0;
       position = null;
     }
   }
   const finalValue = cash + shares * (data[data.length - 1]?.close ?? 0);
-  return { trades, finalValue: parseFloat(finalValue.toFixed(2)), totalReturn: parseFloat(((finalValue / 10000 - 1) * 100).toFixed(2)) };
+  return {
+    trades,
+    finalValue: parseFloat(finalValue.toFixed(2)),
+    totalReturn: parseFloat(((finalValue / 10000 - 1) * 100).toFixed(2)),
+  };
 }
 
-// ─── MOCK DATA GENERATOR ─────────────────────────────────────────────────────
+// ─── DATA SOURCES ─────────────────────────────────────────────────────────────
 
-function generateMockData(ticker, days = 180) {
-  const seed = ticker.charCodeAt(0) + (ticker.charCodeAt(1) ?? 65);
-  let price = 100 + seed * 2;
+// Deterministic fallback using seeded PRNG — same ticker always gives same data
+function seededMockData(ticker, days = 180) {
+  const seed = ticker.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const rand = mulberry32(seed * 31337);
+  let price = 100 + (seed % 200);
   const data = [];
   const start = new Date();
   start.setDate(start.getDate() - days);
@@ -110,18 +143,50 @@ function generateMockData(ticker, days = 180) {
     const date = new Date(start);
     date.setDate(start.getDate() + i);
     if (date.getDay() === 0 || date.getDay() === 6) continue;
-    const vol = (Math.random() - 0.48) * 3;
+    const vol = (rand() - 0.48) * 3;
     price = Math.max(10, price * (1 + vol / 100));
     data.push({
       date: date.toISOString().slice(0, 10),
-      open: parseFloat((price * (1 - Math.random() * 0.01)).toFixed(2)),
-      high: parseFloat((price * (1 + Math.random() * 0.015)).toFixed(2)),
-      low: parseFloat((price * (1 - Math.random() * 0.015)).toFixed(2)),
+      open: parseFloat((price * (1 - rand() * 0.01)).toFixed(2)),
+      high: parseFloat((price * (1 + rand() * 0.015)).toFixed(2)),
+      low: parseFloat((price * (1 - rand() * 0.015)).toFixed(2)),
       close: parseFloat(price.toFixed(2)),
-      volume: Math.floor(500000 + Math.random() * 2000000),
+      volume: Math.floor(500000 + rand() * 2000000),
     });
   }
   return data;
+}
+
+async function fetchYahooData(ticker) {
+  try {
+    const url = `/api/yahoo/v8/finance/chart/${ticker}?range=6mo&interval=1d&includePrePost=false`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result) throw new Error("No data in response");
+    const timestamps = result.timestamp;
+    const quote = result.indicators.quote[0];
+    const rows = timestamps
+      .map((ts, i) => ({
+        date: new Date(ts * 1000).toISOString().slice(0, 10),
+        open: parseFloat((quote.open[i] ?? 0).toFixed(2)),
+        high: parseFloat((quote.high[i] ?? 0).toFixed(2)),
+        low: parseFloat((quote.low[i] ?? 0).toFixed(2)),
+        close: parseFloat((quote.close[i] ?? 0).toFixed(2)),
+        volume: quote.volume[i] ?? 0,
+      }))
+      .filter(d => d.close > 0);
+    if (rows.length < 60) throw new Error("Insufficient data rows");
+    console.log(`✓ Yahoo Finance: ${ticker} — ${rows.length} bars, latest close $${rows[rows.length - 1].close}`);
+    return { rows, source: "Yahoo Finance" };
+  } catch (err) {
+    console.warn(`Yahoo Finance failed for ${ticker}: ${err.message}. Using seeded fallback.`);
+    return { rows: seededMockData(ticker), source: "Simulated (fallback)" };
+  }
 }
 
 // ─── COMPONENTS ───────────────────────────────────────────────────────────────
@@ -161,16 +226,34 @@ const CustomTooltip = ({ active, payload, label }) => {
 
 // ─── AI ANALYSIS ──────────────────────────────────────────────────────────────
 
-async function getAIAnalysis(ticker, totalReturn, trades, lastRSI, lastSignal, apiKey) {
-  const prompt = `You are a quantitative analyst. Analyze this trading algorithm result for ${ticker}:
-- Strategy: EMA 20/50 Crossover + RSI Filter
+// Fixed: includes MACD, correct win rate, DEPLOY/NEEDS WORK/REBUILD verdict
+async function getAIAnalysis(ticker, totalReturn, trades, lastRSI, lastSignal, lastMACD, apiKey) {
+  const winRate = trades.length
+    ? ((trades.filter(t => t.profit > 0).length / trades.length) * 100).toFixed(0)
+    : 0;
+
+  const prompt = `You are a quantitative analyst reviewing an internal trading algorithm backtest.
+
+Ticker: ${ticker}
+Strategy: EMA 20/50 Crossover + RSI 14 Filter
+Period: ~180 trading days | Starting Capital: $10,000
+
+Results:
 - Total Return: ${totalReturn}%
 - Total Trades: ${trades.length}
+- Win Rate: ${winRate}%
 - Last Signal: ${lastSignal}
-- Current RSI: ${lastRSI}
-- Win Rate: ${trades.length ? ((trades.filter(t => t.profit > 0).length / trades.length) * 100).toFixed(0) : 0}%
+- Current RSI (14): ${lastRSI}
+- Last MACD Histogram: ${lastMACD}
 
-Give a SHORT 3-bullet analysis: market condition assessment, strategy performance, and one risk warning. Keep each bullet under 20 words. Format as bullet points with emoji.`;
+Provide a SHORT analysis with exactly this format:
+• [emoji] Market condition assessment (under 20 words)
+• [emoji] Strategy performance for this ticker (under 20 words)
+• [emoji] Specific risk warning based on the actual data (under 20 words)
+
+VERDICT: DEPLOY (return > 10% and win rate ≥ 50%) | NEEDS WORK (0–10% return or inconsistent) | REBUILD (negative return or fewer than 2 trades)
+
+Be direct. Use the actual numbers. No generic advice.`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -182,7 +265,7 @@ Give a SHORT 3-bullet analysis: market condition assessment, strategy performanc
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
+      max_tokens: 400,
       messages: [{ role: "user", content: prompt }]
     })
   });
@@ -201,15 +284,23 @@ export default function TradingAlgo() {
   const [result, setResult] = useState(null);
   const [rsiData, setRsiData] = useState([]);
   const [macdData, setMacdData] = useState([]);
+  const [dataSource, setDataSource] = useState("");
+  const [loading, setLoading] = useState(false);
   const [aiText, setAiText] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState("");
   const [activeTab, setActiveTab] = useState("price");
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
+  const currentTickerRef = useRef(ticker);
 
-  const run = useCallback((sym) => {
-    const raw = generateMockData(sym);
+  const run = useCallback(async (sym) => {
+    currentTickerRef.current = sym;
+    setLoading(true);
+    setAiText("");
+    setAiError("");
+    const { rows: raw, source } = await fetchYahooData(sym);
+    if (currentTickerRef.current !== sym) return; // discard stale response
     const ema20 = calcEMA(raw, 20);
     const ema50 = calcEMA(raw, 50);
     const rsi = calcRSI(raw);
@@ -228,14 +319,14 @@ export default function TradingAlgo() {
     setResult(bt);
     setRsiData(raw.map((d, i) => ({ date: d.date, rsi: rsi[i] })));
     setMacdData(raw.map((d, i) => ({ date: d.date, macd: macdLine[i], signal: signal[i], hist: histogram[i] })));
-    setAiText("");
-    setAiError("");
+    setDataSource(source);
+    setLoading(false);
   }, []);
 
   useEffect(() => { run(ticker); }, [ticker, run]);
 
   const handleAI = async () => {
-    if (!result) return;
+    if (aiLoading || !result) return; // guard against duplicate calls
     if (!apiKey.trim()) {
       setAiError("Please enter your Anthropic API key above to use AI analysis.");
       return;
@@ -245,7 +336,8 @@ export default function TradingAlgo() {
     try {
       const lastRSI = rsiData.filter(r => r.rsi != null).slice(-1)[0]?.rsi ?? 50;
       const lastSig = signals.slice(-1)[0]?.type ?? "None";
-      const text = await getAIAnalysis(ticker, result.totalReturn, result.trades, lastRSI, lastSig, apiKey);
+      const lastMACD = macdData.filter(d => d.hist != null).slice(-1)[0]?.hist ?? 0;
+      const text = await getAIAnalysis(ticker, result.totalReturn, result.trades, lastRSI, lastSig, lastMACD, apiKey);
       setAiText(text);
     } catch (e) {
       setAiError(`Error: ${e.message}`);
@@ -308,15 +400,24 @@ export default function TradingAlgo() {
 
         {/* METRICS ROW */}
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-          <Metric label="Ticker" value={ticker} sub="Simulated OHLCV data" />
+          <Metric
+            label="Ticker"
+            value={ticker}
+            sub={loading ? "Loading data..." : dataSource || "—"}
+          />
           <Metric
             label="Total Return"
-            value={`${result?.totalReturn > 0 ? "+" : ""}${result?.totalReturn ?? 0}%`}
-            sub={`$10,000 → $${result?.finalValue?.toLocaleString()}`}
+            value={loading ? "—" : `${result?.totalReturn > 0 ? "+" : ""}${result?.totalReturn ?? 0}%`}
+            sub={loading ? "" : `$10,000 → $${result?.finalValue?.toLocaleString()}`}
             color={result?.totalReturn >= 0 ? "#00ff88" : "#ff4b4b"}
           />
-          <Metric label="Total Trades" value={result?.trades.length ?? 0} sub="Round trips" />
-          <Metric label="Win Rate" value={`${winRate}%`} sub={`${result?.trades.filter(t => t.profit > 0).length ?? 0} winning trades`} color={winRate >= 50 ? "#00ff88" : "#ff4b4b"} />
+          <Metric label="Total Trades" value={loading ? "—" : result?.trades.length ?? 0} sub="Round trips" />
+          <Metric
+            label="Win Rate"
+            value={loading ? "—" : `${winRate}%`}
+            sub={`${result?.trades.filter(t => t.profit > 0).length ?? 0} winning trades`}
+            color={winRate >= 50 ? "#00ff88" : "#ff4b4b"}
+          />
           <Metric
             label="Last Signal"
             value={lastSignal?.type ?? "—"}
@@ -339,8 +440,14 @@ export default function TradingAlgo() {
           ))}
         </div>
 
+        {loading && (
+          <div style={{ padding: 40, textAlign: "center", color: "#4b5563", fontSize: 13 }}>
+            Fetching data for <b style={{ color: "#00d4ff" }}>{ticker}</b>...
+          </div>
+        )}
+
         {/* PRICE CHART */}
-        {activeTab === "price" && (
+        {!loading && activeTab === "price" && (
           <div style={{ background: "#0d1117", borderRadius: 12, border: "1px solid #1e2130", padding: "20px 16px" }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 16, color: "#94a3b8" }}>
               Price · EMA 20 · EMA 50 · Buy/Sell Signals
@@ -358,7 +465,7 @@ export default function TradingAlgo() {
                 <YAxis tick={{ fontSize: 10, fill: "#4b5563" }} tickLine={false} width={60} />
                 <Tooltip content={<CustomTooltip />} />
                 <Area type="monotone" dataKey="close" stroke="#00d4ff" strokeWidth={1.5} fill="url(#priceGrad)" dot={false} name="Close" />
-                <Line type="monotone" dataKey="ema20" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="EMA 20" />
+                <Line type="monotone" dataKey="ema20" stroke="#facc15" strokeWidth={1.5} dot={false} name="EMA 20" />
                 <Line type="monotone" dataKey="ema50" stroke="#8b5cf6" strokeWidth={1.5} dot={false} name="EMA 50" />
                 {signals.map((s, i) => (
                   <ReferenceLine key={i} x={s.date} stroke={s.type === "BUY" ? "#00ff88" : "#ff4b4b"} strokeDasharray="4 2" strokeWidth={1} />
@@ -367,7 +474,7 @@ export default function TradingAlgo() {
             </ResponsiveContainer>
             <div style={{ display: "flex", gap: 20, marginTop: 12, fontSize: 11, color: "#6b7280" }}>
               <span style={{ color: "#00d4ff" }}>── Price</span>
-              <span style={{ color: "#f59e0b" }}>── EMA 20</span>
+              <span style={{ color: "#facc15" }}>── EMA 20</span>
               <span style={{ color: "#8b5cf6" }}>── EMA 50</span>
               <span style={{ color: "#00ff88" }}>| BUY</span>
               <span style={{ color: "#ff4b4b" }}>| SELL</span>
@@ -376,7 +483,7 @@ export default function TradingAlgo() {
         )}
 
         {/* RSI CHART */}
-        {activeTab === "rsi" && (
+        {!loading && activeTab === "rsi" && (
           <div style={{ background: "#0d1117", borderRadius: 12, border: "1px solid #1e2130", padding: "20px 16px" }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4, color: "#94a3b8" }}>RSI (14) — Overbought: 70 · Oversold: 30</div>
             <div style={{ fontSize: 11, color: "#4b5563", marginBottom: 16 }}>Buy when RSI &lt; 70 (not overbought) · Sell when RSI &gt; 30 (not oversold)</div>
@@ -401,7 +508,7 @@ export default function TradingAlgo() {
         )}
 
         {/* MACD CHART */}
-        {activeTab === "macd" && (
+        {!loading && activeTab === "macd" && (
           <div style={{ background: "#0d1117", borderRadius: 12, border: "1px solid #1e2130", padding: "20px 16px" }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 16, color: "#94a3b8" }}>MACD (12, 26, 9) — Momentum Confirmation</div>
             <ResponsiveContainer width="100%" height={280}>
@@ -412,7 +519,7 @@ export default function TradingAlgo() {
                 <Tooltip content={<CustomTooltip />} />
                 <ReferenceLine y={0} stroke="#2d3748" />
                 <Bar dataKey="hist" name="Histogram" fill="#00d4ff" opacity={0.6} />
-                <Line type="monotone" dataKey="macd" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="MACD" />
+                <Line type="monotone" dataKey="macd" stroke="#facc15" strokeWidth={1.5} dot={false} name="MACD" />
                 <Line type="monotone" dataKey="signal" stroke="#ff4b4b" strokeWidth={1.5} dot={false} name="Signal" />
                 <Legend wrapperStyle={{ fontSize: 11, color: "#6b7280" }} />
               </BarChart>
@@ -421,13 +528,18 @@ export default function TradingAlgo() {
         )}
 
         {/* TRADES TABLE */}
-        {activeTab === "trades" && (
+        {!loading && activeTab === "trades" && (
           <div style={{ background: "#0d1117", borderRadius: 12, border: "1px solid #1e2130", overflow: "hidden" }}>
             <div style={{ padding: "16px 20px", borderBottom: "1px solid #1a1f2e", fontSize: 13, fontWeight: 600, color: "#94a3b8" }}>
               Trade History · $10,000 starting capital
             </div>
             {result?.trades.length === 0 ? (
-              <div style={{ padding: 32, textAlign: "center", color: "#4b5563" }}>No completed trades in this period.</div>
+              <div style={{ padding: 40, textAlign: "center", color: "#4b5563", fontSize: 13 }}>
+                No signals generated in this 180-day window.<br />
+                <span style={{ fontSize: 11, marginTop: 6, display: "block" }}>
+                  No EMA crossovers met the RSI criteria — portfolio stays at $10,000.
+                </span>
+              </div>
             ) : (
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                 <thead>
@@ -467,7 +579,7 @@ export default function TradingAlgo() {
           <div style={{ flex: 2, minWidth: 280, background: "#0d1117", borderRadius: 12, border: "1px solid #1e2130", padding: "20px" }}>
             <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 14, color: "#00d4ff" }}>Algorithm Logic</div>
             {[
-              { step: "1", label: "Data Source", desc: "Simulated OHLCV · integrate yfinance Python backend for real data" },
+              { step: "1", label: "Data Source", desc: "Live OHLCV via Yahoo Finance · seeded simulation as fallback" },
               { step: "2", label: "Entry Signal", desc: "EMA 20 crosses ABOVE EMA 50 AND RSI < 70" },
               { step: "3", label: "Exit Signal", desc: "EMA 20 crosses BELOW EMA 50 AND RSI > 30" },
               { step: "4", label: "Confirmation", desc: "MACD histogram direction as secondary filter" },
@@ -492,7 +604,7 @@ export default function TradingAlgo() {
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
               <div style={{ fontSize: 13, fontWeight: 700, color: "#8b5cf6" }}>AI Analysis (Claude)</div>
               <button onClick={handleAI} disabled={aiLoading} style={{
-                padding: "7px 18px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer",
+                padding: "7px 18px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: aiLoading ? "not-allowed" : "pointer",
                 background: aiLoading ? "#1a1f2e" : "linear-gradient(135deg, #7c3aed, #4f46e5)",
                 color: "#fff", border: "none", opacity: aiLoading ? 0.7 : 1,
               }}>
@@ -544,7 +656,7 @@ export default function TradingAlgo() {
 
         {/* FOOTER */}
         <div style={{ fontSize: 11, color: "#374151", textAlign: "center", paddingTop: 4 }}>
-          Educational use only. Not financial advice. Data is simulated for demo purposes.
+          Internal use only. Not financial advice. Live data via Yahoo Finance.
         </div>
       </div>
     </div>
